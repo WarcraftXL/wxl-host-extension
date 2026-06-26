@@ -22,6 +22,8 @@
 #include "core/Logger.hpp"
 #include "mpq/MpqStore.hpp"
 
+#include <windows.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -49,7 +51,7 @@ namespace
     using wxl::host::mpq::MpqStore;
 
     constexpr uint32_t kThreads  = 3;
-    constexpr size_t   kQueueCap = 4096;
+    constexpr size_t   kQueueCap = 32768;
 
     std::mutex              g_qmutex;
     std::condition_variable g_cv;
@@ -59,10 +61,38 @@ namespace
     std::once_flag          g_poolOnce;
 
     /**
-     * @brief Pool thread body: owns an MpqStore, drains the queue, and warms the shared cache in place.
+     * @brief Scans a served asset for its direct dependencies and enqueues the new ones, waking the pool.
+     * @param name   asset name whose bytes are being scanned.
+     * @param bytes  served payload to extract dependency names from.
+     */
+    void EnqueueDeps(std::string_view name, std::span<const uint8_t> bytes)
+    {
+        std::vector<std::string> deps;
+        scan::Scan(name, bytes, deps);
+        if (deps.empty()) return;
+
+        bool any = false;
+        {
+            std::lock_guard<std::mutex> lk(g_qmutex);
+            for (std::string& d : deps)
+            {
+                if (g_queue.size() >= kQueueCap) break;
+                if (g_seen.insert(d).second) { g_queue.push_back(std::move(d)); any = true; }
+            }
+        }
+        if (any) g_cv.notify_all();
+    }
+
+    /**
+     * @brief Pool thread body: owns an MpqStore, drains the queue, warms the shared cache in place, and
+     *        enqueues each warmed asset's own dependencies so the whole reachable tree is warmed ahead of
+     *        the client.
      */
     void Worker()
     {
+        // Background warming yields to the serve thread so it never slows the client's actual opens.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
         MpqStore store;
         store.Mount(wxl::host::ClientRoot());
 
@@ -83,10 +113,14 @@ namespace
             raw.clear();
             if (!store.ReadAll(name, raw)) continue;
 
-            // Produce the served form (apply any module transform), then store it directly in the shared cache.
+            // Produce the served form (apply any module transform), then store it directly in the shared
+            // cache and warm this asset's own dependencies (the transitive closure, bounded by the dedup
+            // set and the queue cap).
             reshaped.clear();
-            if (wxl::host::Transform(name, raw, reshaped)) hx::Cache().Put(name, reshaped);
-            else                                           hx::Cache().Put(name, raw);
+            const std::vector<uint8_t>& served =
+                wxl::host::Transform(name, raw, reshaped) ? reshaped : raw;
+            hx::Cache().Put(name, served);
+            EnqueueDeps(name, served);
 
             uint32_t w = ++g_warmed;
             if ((w % 1000) == 0) wlog::Printf("prefetch: warmed=%u", w);
@@ -112,21 +146,7 @@ namespace
     void OnServed(std::string_view name, std::span<const uint8_t> bytes)
     {
         std::call_once(g_poolOnce, StartPool);
-
-        std::vector<std::string> deps;
-        scan::Scan(name, bytes, deps);
-        if (deps.empty()) return;
-
-        bool any = false;
-        {
-            std::lock_guard<std::mutex> lk(g_qmutex);
-            for (std::string& d : deps)
-            {
-                if (g_queue.size() >= kQueueCap) break;
-                if (g_seen.insert(d).second) { g_queue.push_back(std::move(d)); any = true; }
-            }
-        }
-        if (any) g_cv.notify_all();
+        EnqueueDeps(name, bytes);
     }
 
     /**
